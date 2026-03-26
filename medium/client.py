@@ -1,0 +1,257 @@
+"""
+Medium API client.
+
+Supports two access paths:
+
+1. REST API (https://api.medium.com/v1) — official but frozen.
+   Requires MEDIUM_INTEGRATION_TOKEN.
+   Works for: get current user, get publications, create post.
+   ⚠ Medium is no longer issuing new tokens — only existing holders can use this.
+
+2. Unofficial session-based access — uses the browser `sid` cookie.
+   Requires MEDIUM_SESSION_COOKIE.
+   Works for: list published posts, get per-post stats.
+   ⚠ Unofficial endpoints — undocumented and may change without notice.
+
+Auth env vars:
+  MEDIUM_INTEGRATION_TOKEN  — REST API Bearer token
+  MEDIUM_SESSION_COOKIE     — 'sid' cookie value from browser DevTools
+"""
+
+import json
+import os
+from typing import Any, Optional
+
+import httpx
+
+MEDIUM_REST_BASE = "https://api.medium.com/v1"
+MEDIUM_WEB_BASE = "https://medium.com"
+DEFAULT_TIMEOUT = 20.0
+
+
+# ── Auth helpers ───────────────────────────────────────────────────────────────
+
+def _integration_token() -> str:
+    token = os.environ.get("MEDIUM_INTEGRATION_TOKEN", "").strip()
+    if not token:
+        raise ValueError(
+            "MEDIUM_INTEGRATION_TOKEN is not set. "
+            "Add it to your environment: "
+            "Medium Settings → Security and Apps → Integration tokens. "
+            "Note: Medium is no longer issuing new tokens to new users."
+        )
+    return token
+
+
+def _session_cookie() -> str:
+    cookie = os.environ.get("MEDIUM_SESSION_COOKIE", "").strip()
+    if not cookie:
+        raise ValueError(
+            "MEDIUM_SESSION_COOKIE is not set. "
+            "Extract your 'sid' cookie from medium.com: "
+            "Log in → DevTools → Application → Cookies → medium.com → copy the 'sid' value."
+        )
+    return cookie
+
+
+def _rest_headers(token: Optional[str] = None) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token or _integration_token()}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Charset": "utf-8",
+    }
+
+
+def _session_headers(session_cookie: Optional[str] = None) -> dict[str, str]:
+    sid = session_cookie or _session_cookie()
+    return {
+        "Cookie": f"sid={sid}",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def _strip_xssi(text: str) -> str:
+    """
+    Strip Medium's XSSI (cross-site script inclusion) prefix.
+
+    Medium's unofficial JSON endpoints prepend a prefix like `])}while(1);</x>`
+    to prevent the response from being parsed as JavaScript in a <script> tag.
+    We must strip this before calling json.loads().
+    """
+    for prefix in ("])}while(1);</x>", "])}while(1);<x>", "])}while(1);"):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def _parse_medium_json(text: str) -> Any:
+    return json.loads(_strip_xssi(text))
+
+
+# ── REST API operations ────────────────────────────────────────────────────────
+
+async def get_current_user() -> dict[str, Any]:
+    """
+    Fetch the authenticated Medium user's profile via REST API.
+
+    Returns: id, username, name, url, imageUrl.
+    Auth: MEDIUM_INTEGRATION_TOKEN
+    """
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        r = await client.get(
+            f"{MEDIUM_REST_BASE}/me",
+            headers=_rest_headers(),
+        )
+        r.raise_for_status()
+        data = r.json()
+    return data.get("data", data)
+
+
+async def get_publications(user_id: str) -> list[dict[str, Any]]:
+    """
+    List publications the authenticated user has publishing rights to.
+
+    Returns: list of {id, name, description, url, imageUrl}.
+    Auth: MEDIUM_INTEGRATION_TOKEN
+    """
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        r = await client.get(
+            f"{MEDIUM_REST_BASE}/users/{user_id}/publications",
+            headers=_rest_headers(),
+        )
+        r.raise_for_status()
+        data = r.json()
+    return data.get("data", [])
+
+
+async def create_post(
+    user_id: str,
+    title: str,
+    content: str,
+    content_format: str = "markdown",
+    publish_status: str = "draft",
+    tags: Optional[list[str]] = None,
+    canonical_url: Optional[str] = None,
+    publication_id: Optional[str] = None,
+    notify_followers: bool = False,
+    license: str = "all-rights-reserved",
+) -> dict[str, Any]:
+    """
+    Create a Medium post via the REST API.
+
+    If publication_id is given, creates under that publication;
+    otherwise creates under the user directly.
+
+    content_format:  'markdown' | 'html'
+    publish_status:  'draft' | 'public' | 'unlisted'
+    license:         'all-rights-reserved' | 'cc-40-by' | 'cc-40-by-sa' |
+                     'cc-40-by-nd' | 'cc-40-by-nc' | 'cc-40-by-nc-nd' |
+                     'cc-40-by-nc-sa' | 'cc-40-zero' | 'public-domain'
+    tags:            up to 5 tag strings (Medium's limit)
+
+    Auth: MEDIUM_INTEGRATION_TOKEN
+    """
+    payload: dict[str, Any] = {
+        "title": title,
+        "contentFormat": content_format,
+        "content": content,
+        "publishStatus": publish_status,
+        "license": license,
+        "notifyFollowers": notify_followers,
+    }
+    if tags:
+        payload["tags"] = tags[:5]  # Medium enforces a 5-tag limit
+    if canonical_url:
+        payload["canonicalUrl"] = canonical_url
+
+    if publication_id:
+        url = f"{MEDIUM_REST_BASE}/publications/{publication_id}/posts"
+    else:
+        url = f"{MEDIUM_REST_BASE}/users/{user_id}/posts"
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        r = await client.post(url, headers=_rest_headers(), json=payload)
+        r.raise_for_status()
+        data = r.json()
+    return data.get("data", data)
+
+
+# ── Unofficial session-based operations ───────────────────────────────────────
+
+async def list_posts(
+    username: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    List published posts for a Medium user via the unofficial internal API.
+
+    Requires the user to be logged in (MEDIUM_SESSION_COOKIE) to reliably
+    retrieve their own posts, including member-only ones.
+
+    Returns a list of post objects with title, id, slug, publishedAt,
+    virtuals.totalClapCount, and canonicalUrl where available.
+
+    Auth: MEDIUM_SESSION_COOKIE
+    """
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        r = await client.get(
+            f"{MEDIUM_WEB_BASE}/@{username}/latest",
+            headers=_session_headers(),
+            params={"format": "json", "limit": limit},
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = _parse_medium_json(r.text)
+
+    payload = data.get("payload", {})
+    if not isinstance(payload, dict):
+        return []
+
+    # Posts live under payload.streamItems (type "postPreview") or
+    # payload.references.Post (a dict keyed by post ID).
+    post_refs: dict[str, Any] = payload.get("references", {}).get("Post", {})
+    if post_refs:
+        return list(post_refs.values())
+
+    # Fallback: filter streamItems for postPreview type.
+    stream_items = payload.get("streamItems", [])
+    posts = []
+    for item in stream_items:
+        if item.get("itemType") == "postPreview":
+            preview = item.get("postPreview", item)
+            posts.append(preview)
+    return posts
+
+
+async def get_post_stats(post_id: str) -> dict[str, Any]:
+    """
+    Fetch view, read, and clap stats for a specific Medium post.
+
+    Requires MEDIUM_SESSION_COOKIE and that the authenticated user
+    is the author of the post (stats are only visible to the author).
+
+    post_id: the internal Medium post ID (e.g. 'a1b2c3d4e5f6').
+             Found in the post URL or returned by medium_list_posts.
+
+    Auth: MEDIUM_SESSION_COOKIE
+    """
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        r = await client.get(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/stats",
+            headers=_session_headers(),
+            params={"format": "json"},
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = _parse_medium_json(r.text)
+
+    payload = data.get("payload", data)
+    if isinstance(payload, dict):
+        return payload.get("value", payload)
+    return data

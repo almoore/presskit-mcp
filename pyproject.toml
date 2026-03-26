@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "publishing-mcp"
+version = "0.1.0"
+description = "MCP server for Medium and Substack publishing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.3.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "python-substack>=0.1.17",   # Substack auth + ProseMirror post formatting
+    "python-dotenv>=1.0.0",      # Optional: load .env file for credentials
+]
+
+[project.scripts]
+publishing-mcp = "server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["medium", "substack"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

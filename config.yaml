@@ -1,0 +1,50 @@
+# publishing_mcp configuration reference
+# ─────────────────────────────────────────────────────────────────────────────
+# Do NOT commit real credentials to version control.
+# Set these as environment variables, or use a .env file with python-dotenv.
+#
+# Usage with Claude Desktop (claude_desktop_config.json):
+#
+#   {
+#     "mcpServers": {
+#       "publishing": {
+#         "command": "python",
+#         "args": ["/path/to/publishing_mcp/server.py"],
+#         "env": {
+#           "MEDIUM_INTEGRATION_TOKEN": "...",
+#           "MEDIUM_SESSION_COOKIE":    "...",
+#           "SUBSTACK_EMAIL":           "...",
+#           "SUBSTACK_PASSWORD":        "...",
+#           "SUBSTACK_PUBLICATION_URL": "https://yourpub.substack.com"
+#         }
+#       }
+#     }
+#   }
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+medium:
+  # Deprecated REST API token — works only for existing token holders.
+  # Medium Settings > Security and Apps > Integration tokens
+  # No new tokens are being issued by Medium.
+  integration_token: ${MEDIUM_INTEGRATION_TOKEN}
+
+  # Session cookie (sid) for unofficial GraphQL access.
+  # Extract from: browser DevTools > Application > Cookies > medium.com > sid
+  # Needed for: medium_list_posts, medium_get_post_stats
+  session_cookie: ${MEDIUM_SESSION_COOKIE}
+
+substack:
+  # Recommended: email + password auth via python-substack.
+  # If your Substack account has no password, set one first:
+  #   Sign out > "Sign in with password" > "Set a new password"
+  email: ${SUBSTACK_EMAIL}
+  password: ${SUBSTACK_PASSWORD}
+
+  # Your publication URL — required for all write operations.
+  # Example: https://myblog.substack.com
+  publication_url: ${SUBSTACK_PUBLICATION_URL}
+
+  # Cookie string fallback (only if you cannot use email/password).
+  # Extract from: browser DevTools > Network > any substack request > Cookie header
+  cookies_string: ${SUBSTACK_COOKIES_STRING}
