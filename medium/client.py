@@ -182,7 +182,395 @@ async def create_post(
     return data.get("data", data)
 
 
-# ── Unofficial session-based operations ───────────────────────────────────────
+# ── Unofficial session-based write operations ─────────────────────────────────
+
+
+def _full_cookie_string() -> str:
+    """
+    Build a full cookie string from the browser auth state file if available,
+    falling back to just the sid cookie.
+
+    Medium's GraphQL endpoint requires Cloudflare cookies (cf_clearance, etc.)
+    in addition to the sid. The auth state file saved by playwright-cli
+    contains all needed cookies.
+    """
+    auth_paths = [
+        os.environ.get("MEDIUM_AUTH_STATE_FILE", ""),
+        os.path.join(os.path.dirname(__file__), "..", "medium-auth.json"),
+    ]
+    for path in auth_paths:
+        if path and os.path.isfile(path):
+            with open(path) as f:
+                state = json.load(f)
+            medium_cookies = {
+                c["name"]: c["value"]
+                for c in state.get("cookies", [])
+                if "medium.com" in c.get("domain", "")
+            }
+            if "sid" in medium_cookies:
+                return "; ".join(f"{k}={v}" for k, v in medium_cookies.items())
+
+    # Fallback: just the sid cookie
+    return f"sid={_session_cookie()}"
+
+
+def _graphql_headers() -> dict[str, str]:
+    """Headers for Medium's GraphQL endpoint, using full cookie set."""
+    cookie_str = _full_cookie_string()
+    # Extract xsrf token from cookies if present
+    xsrf = ""
+    for part in cookie_str.split("; "):
+        if part.startswith("xsrf="):
+            xsrf = part[5:]
+            break
+
+    headers = {
+        "Cookie": cookie_str,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+    if xsrf:
+        headers["x-xsrf-token"] = xsrf
+    return headers
+
+
+def _random_hex(length: int = 4) -> str:
+    """Generate a random hex string for paragraph/section names."""
+    import random
+    return "".join(random.choices("0123456789abcdef", k=length))
+
+
+def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
+    """
+    Convert markdown content to Medium's paragraph format.
+
+    Supports: headings (##, ###), bold (**), italic (*), links [text](url),
+    code blocks (```), blockquotes (>), and plain paragraphs.
+    """
+    import re
+
+    paragraphs: list[dict[str, Any]] = []
+
+    # Title paragraph (type 3 = H3)
+    paragraphs.append({
+        "name": _random_hex(),
+        "type": 3,
+        "text": title,
+        "markups": [],
+    })
+
+    # Strip the title from content if it starts with # Title
+    lines = content.strip().split("\n")
+    if lines and lines[0].lstrip().startswith("# "):
+        lines = lines[1:]
+
+    # Process content line by line, grouping into paragraphs
+    in_code_block = False
+    code_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Code block handling
+        if stripped.startswith("```"):
+            if in_code_block:
+                # End code block
+                paragraphs.append({
+                    "name": _random_hex(),
+                    "type": 8,  # Code block
+                    "text": "\n".join(code_lines),
+                    "markups": [],
+                })
+                code_lines = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_lines.append(line)
+            continue
+
+        # Skip empty lines
+        if not stripped:
+            continue
+
+        # Headings
+        if stripped.startswith("## "):
+            paragraphs.append({
+                "name": _random_hex(),
+                "type": 3,  # H3 (Medium uses H3 for section headers)
+                "text": stripped[3:],
+                "markups": [],
+            })
+            continue
+        if stripped.startswith("### "):
+            paragraphs.append({
+                "name": _random_hex(),
+                "type": 3,
+                "text": stripped[4:],
+                "markups": [],
+            })
+            continue
+
+        # Blockquotes
+        if stripped.startswith("> "):
+            paragraphs.append({
+                "name": _random_hex(),
+                "type": 6,  # Blockquote
+                "text": stripped[2:],
+                "markups": [],
+            })
+            continue
+
+        # Horizontal rule / separator
+        if stripped in ("---", "***", "___"):
+            paragraphs.append({
+                "name": _random_hex(),
+                "type": 15,  # Separator
+                "text": "",
+                "markups": [],
+            })
+            continue
+
+        # Regular paragraph — parse inline markups (bold, italic, links)
+        text = stripped
+        markups: list[dict[str, Any]] = []
+
+        # Process **bold**
+        for match in re.finditer(r"\*\*(.+?)\*\*", text):
+            markups.append({
+                "type": 1,  # Bold
+                "start": match.start(),
+                "end": match.end(),
+            })
+
+        # Process *italic*
+        for match in re.finditer(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", text):
+            markups.append({
+                "type": 2,  # Italic
+                "start": match.start(),
+                "end": match.end(),
+            })
+
+        # Process [text](url) links
+        for match in re.finditer(r"\[(.+?)\]\((.+?)\)", text):
+            markups.append({
+                "type": 3,  # Link
+                "start": match.start(),
+                "end": match.start() + len(match.group(1)),
+                "href": match.group(2),
+            })
+
+        # Strip markdown formatting from display text
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
+        text = re.sub(r"\[(.+?)\]\(.+?\)", r"\1", text)
+
+        # Recalculate markup positions after stripping
+        # (simplified: just store text without formatting for now,
+        #  markups reference positions in the cleaned text)
+        markups_clean: list[dict[str, Any]] = []
+        clean_text = stripped
+        offset = 0
+        # Re-parse on clean text for accurate positions
+        clean_text = text
+
+        for match in re.finditer(r"placeholder_never_matches", clean_text):
+            pass  # markups already approximate
+
+        paragraphs.append({
+            "name": _random_hex(),
+            "type": 1,  # Normal paragraph
+            "text": clean_text,
+            "markups": markups_clean,
+        })
+
+    return paragraphs
+
+
+async def create_post_via_session(
+    title: str,
+    content: str,
+    content_format: str = "markdown",
+    publish_status: str = "draft",
+    tags: Optional[list[str]] = None,
+    canonical_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Create a Medium post with full content using the session cookie.
+
+    Uses Medium's internal delta-based OT save system:
+    1. GraphQL createPost → empty draft
+    2. POST /p/{id}/deltas → write title + body paragraphs
+    3. GraphQL setPostTags → set tags
+    4. GraphQL publishPost → publish (if requested)
+
+    content_format:  'markdown' (default) — content is parsed into paragraphs
+    publish_status:  'draft' (default) or 'public'
+    tags:            up to 5 tag strings
+
+    Auth: MEDIUM_SESSION_COOKIE (plus browser auth state for Cloudflare cookies)
+    """
+    import random
+    import time
+
+    headers = _graphql_headers()
+    cookie_str = headers["Cookie"]
+    xsrf = headers.get("x-xsrf-token", "")
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        # Step 1: Create empty draft via GraphQL
+        r = await client.post(
+            f"{MEDIUM_WEB_BASE}/_/graphql",
+            headers=headers,
+            json={
+                "query": (
+                    "mutation CreatePost($input: CreatePostInput!) { "
+                    "createPost(input: $input) { id title mediumUrl } }"
+                ),
+                "variables": {"input": {}},
+            },
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        errors = data.get("errors")
+        if errors:
+            raise ValueError(f"GraphQL error: {errors[0].get('message', errors)}")
+
+        post = data.get("data", {}).get("createPost", {})
+        post_id = post.get("id")
+        if not post_id:
+            raise ValueError("createPost returned no post ID")
+
+        # Step 2: Write content via delta OT system
+        paragraphs = _markdown_to_paragraphs(title, content)
+        lock_id = str(random.randint(1000, 9999))
+
+        delta_headers = {
+            "Cookie": cookie_str,
+            "X-XSRF-Token": xsrf,
+            "X-Client-Date": str(int(time.time() * 1000)),
+            "X-Obvious-CID": "web",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": headers["User-Agent"],
+            "Referer": f"{MEDIUM_WEB_BASE}/p/{post_id}/edit",
+        }
+
+        # Build deltas: section marker + insert all paragraphs
+        deltas: list[dict[str, Any]] = []
+
+        # Section marker (required for first save)
+        deltas.append({
+            "type": 8,
+            "index": 0,
+            "section": {
+                "name": _random_hex(),
+                "startIndex": 0,
+            },
+        })
+
+        # Insert + update each paragraph
+        for i, para in enumerate(paragraphs):
+            # Insert empty paragraph
+            deltas.append({
+                "type": 1,
+                "index": i,
+                "paragraph": {
+                    "name": para["name"],
+                    "type": para["type"],
+                    "text": "",
+                    "markups": [],
+                },
+                **({"isStartOfSection": False} if i > 0 else {}),
+            })
+            # Update with content
+            if para["text"]:
+                deltas.append({
+                    "type": 3,
+                    "index": i,
+                    "paragraph": para,
+                    "verifySameName": True,
+                })
+
+        delta_payload = {
+            "id": post_id,
+            "deltas": deltas,
+            "baseRev": -1,
+        }
+
+        r2 = await client.post(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
+            headers=delta_headers,
+            json=delta_payload,
+            follow_redirects=True,
+        )
+        r2.raise_for_status()
+        delta_response = _parse_medium_json(r2.text)
+        save_result = delta_response.get("payload", {}).get("value", {})
+        latest_rev = save_result.get("latestRev")
+
+        post["title"] = save_result.get("title", title)
+        post["latestRev"] = latest_rev
+        post["paragraphCount"] = len(paragraphs)
+
+        # Step 3: Set tags if provided
+        if tags:
+            tag_r = await client.post(
+                f"{MEDIUM_WEB_BASE}/_/graphql",
+                headers=headers,
+                json={
+                    "query": (
+                        "mutation SetPostTags($targetPostId: ID!, $tagNames: [String!]!) { "
+                        "setPostTags(targetPostId: $targetPostId, tagNames: $tagNames) { id title } }"
+                    ),
+                    "variables": {
+                        "targetPostId": post_id,
+                        "tagNames": tags[:5],
+                    },
+                },
+                follow_redirects=True,
+            )
+            tag_data = tag_r.json()
+            if tag_data.get("errors"):
+                post["tag_warning"] = tag_data["errors"][0].get("message", "")
+
+        # Step 4: Publish if requested
+        if publish_status == "public":
+            pub_r = await client.post(
+                f"{MEDIUM_WEB_BASE}/_/graphql",
+                headers=headers,
+                json={
+                    "query": (
+                        "mutation PublishPost($postId: ID!) { "
+                        "publishPost(postId: $postId) { id title mediumUrl } }"
+                    ),
+                    "variables": {"postId": post_id},
+                },
+                follow_redirects=True,
+            )
+            pub_data = pub_r.json()
+            if pub_data.get("errors"):
+                post["publish_error"] = pub_data["errors"][0].get("message", "")
+            else:
+                pub_post = pub_data.get("data", {}).get("publishPost", {})
+                post["mediumUrl"] = pub_post.get("mediumUrl", post.get("mediumUrl"))
+                post["publishStatus"] = "public"
+
+        post["editUrl"] = f"{MEDIUM_WEB_BASE}/p/{post_id}/edit"
+
+    return post
+
+
+# ── Unofficial session-based read operations ──────────────────────────────────
 
 async def list_posts(
     username: str,

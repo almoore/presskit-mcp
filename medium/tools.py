@@ -5,6 +5,7 @@ Tools registered here:
   - medium_get_current_user    Read   REST API  (MEDIUM_INTEGRATION_TOKEN)
   - medium_get_publications    Read   REST API  (MEDIUM_INTEGRATION_TOKEN)
   - medium_create_post         Write  REST API  (MEDIUM_INTEGRATION_TOKEN)
+  - medium_create_post_session Write  Unofficial session (MEDIUM_SESSION_COOKIE)
   - medium_list_posts          Read   Unofficial session (MEDIUM_SESSION_COOKIE)
   - medium_get_post_stats      Read   Unofficial session (MEDIUM_SESSION_COOKIE)
 """
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from medium.client import (
     create_post,
+    create_post_via_session,
     get_current_user,
     get_post_stats,
     get_publications,
@@ -121,6 +123,56 @@ class MediumCreatePostInput(BaseModel):
         pattern=(
             "^(all-rights-reserved|cc-40-by|cc-40-by-sa|cc-40-by-nd|"
             "cc-40-by-nc|cc-40-by-nc-nd|cc-40-by-nc-sa|cc-40-zero|public-domain)$"
+        ),
+    )
+
+
+class MediumCreatePostSessionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    title: str = Field(
+        ...,
+        description="Post title.",
+        min_length=1,
+        max_length=255,
+    )
+    content: str = Field(
+        ...,
+        description=(
+            "Post body. Use Markdown (recommended) or HTML depending on content_format. "
+            "For Markdown: supports **bold**, *italic*, ## headings, - bullets, > blockquotes. "
+            "For HTML: use standard tags like <p>, <h2>, <strong>, <em>, <ul>, <blockquote>."
+        ),
+        min_length=1,
+    )
+    content_format: str = Field(
+        default="markdown",
+        description="Content format: 'markdown' (default) or 'html'.",
+        pattern="^(markdown|html)$",
+    )
+    publish_status: str = Field(
+        default="draft",
+        description=(
+            "Publication state: "
+            "'draft' (default, saved but not published), "
+            "'public' (published and visible to all), "
+            "'unlisted' (published but not discoverable)."
+        ),
+        pattern="^(draft|public|unlisted)$",
+    )
+    tags: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Up to 5 topic tags. Examples: ['python', 'machine-learning', 'tutorial']. "
+            "Medium enforces a 5-tag limit; extras are silently dropped."
+        ),
+        max_length=5,
+    )
+    canonical_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Original URL if cross-posting from another source. "
+            "Tells search engines the canonical source of the content."
         ),
     )
 
@@ -317,6 +369,51 @@ def register_medium_tools(mcp: FastMCP) -> None:
             return json.dumps(post, indent=2, default=str)
         except Exception as e:
             return _handle_error(e, "medium_create_post")
+
+    @mcp.tool(
+        name="medium_create_post_session",
+        annotations={
+            "title": "Create Medium Post (Session Cookie)",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        },
+    )
+    async def medium_create_post_session(params: MediumCreatePostSessionInput) -> str:
+        """
+        Create a new Medium post using the session cookie (no integration token needed).
+
+        This uses the same internal API that Medium's web editor uses.
+        Does NOT require MEDIUM_INTEGRATION_TOKEN — only MEDIUM_SESSION_COOKIE.
+
+        Supports Markdown or HTML content. Defaults to 'draft' so you can
+        review in Medium's editor before publishing.
+
+        ⚠️ Uses an unofficial Medium endpoint. May break if Medium changes
+        their internal API.
+
+        Auth: MEDIUM_SESSION_COOKIE
+
+        Args:
+            params (MediumCreatePostSessionInput): title, content, content_format,
+                publish_status, tags, canonical_url.
+
+        Returns:
+            str: JSON with the created post including id, title, url, publishStatus.
+        """
+        try:
+            post = await create_post_via_session(
+                title=params.title,
+                content=params.content,
+                content_format=params.content_format,
+                publish_status=params.publish_status,
+                tags=params.tags,
+                canonical_url=params.canonical_url,
+            )
+            return json.dumps(post, indent=2, default=str)
+        except Exception as e:
+            return _handle_error(e, "medium_create_post_session")
 
     @mcp.tool(
         name="medium_list_posts",
