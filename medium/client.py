@@ -239,18 +239,73 @@ def _graphql_headers() -> dict[str, str]:
     return headers
 
 
+async def upload_image(
+    image_path: str,
+    post_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Upload an image to Medium's internal CDN.
+
+    Endpoint: POST https://medium.com/_/upload?source=6
+    Returns: {fileId, md5, mimeType, fileSize, fileName, imgWidth, imgHeight}
+
+    The fileId (e.g. '1*abc123.png') is used as the data_id in image
+    paragraph deltas to embed the image in a post.
+
+    Auth: Full browser cookie set (MEDIUM_AUTH_STATE_FILE)
+    """
+    import mimetypes
+
+    headers = _graphql_headers()
+    upload_headers = {k: v for k, v in headers.items() if k != "Content-Type"}
+    xsrf = headers.get("x-xsrf-token", "")
+    if xsrf:
+        upload_headers["X-XSRF-Token"] = xsrf
+    upload_headers["X-Obvious-CID"] = "web"
+    upload_headers["Accept"] = "application/json"
+
+    mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+    filename = os.path.basename(image_path)
+
+    with open(image_path, "rb") as f:
+        image_data = f.read()
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            f"{MEDIUM_WEB_BASE}/_/upload?source=6",
+            headers=upload_headers,
+            files={"image": (filename, image_data, mime_type)},
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = _parse_medium_json(r.text)
+
+    payload = data.get("payload", {}).get("value", {})
+    if not payload.get("fileId"):
+        raise ValueError(f"Image upload failed: {data}")
+    return payload
+
+
 def _random_hex(length: int = 4) -> str:
     """Generate a random hex string for paragraph/section names."""
     import random
     return "".join(random.choices("0123456789abcdef", k=length))
 
 
-def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
+async def _markdown_to_paragraphs(
+    title: str,
+    content: str,
+    base_path: Optional[str] = None,
+    post_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
     """
     Convert markdown content to Medium's paragraph format.
 
     Supports: headings (##, ###), bold (**), italic (*), links [text](url),
-    code blocks (```), blockquotes (>), and plain paragraphs.
+    code blocks (```), blockquotes (>), images (![alt](path)), and plain paragraphs.
+
+    If base_path is provided, relative image paths are resolved against it.
+    Images are uploaded to Medium's CDN and inserted as type-4 paragraphs.
     """
     import re
 
@@ -272,6 +327,7 @@ def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
     # Process content line by line, grouping into paragraphs
     in_code_block = False
     code_lines: list[str] = []
+    image_re = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 
     for line in lines:
         stripped = line.strip()
@@ -279,7 +335,6 @@ def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
         # Code block handling
         if stripped.startswith("```"):
             if in_code_block:
-                # End code block
                 paragraphs.append({
                     "name": _random_hex(),
                     "type": 8,  # Code block
@@ -300,11 +355,61 @@ def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
         if not stripped:
             continue
 
+        # Images: ![alt text](path/to/image.png)
+        img_match = image_re.match(stripped)
+        if img_match:
+            alt_text = img_match.group(1)
+            img_src = img_match.group(2)
+
+            # Resolve relative paths
+            if not img_src.startswith(("http://", "https://")):
+                if base_path:
+                    img_src = os.path.join(base_path, img_src)
+                if os.path.isfile(img_src):
+                    try:
+                        img_info = await upload_image(img_src, post_id=post_id)
+                        paragraphs.append({
+                            "name": _random_hex(),
+                            "type": 4,  # Image
+                            "text": alt_text,
+                            "markups": [],
+                            "metadata": {
+                                "id": img_info["fileId"],
+                                "originalWidth": img_info.get("imgWidth", 0),
+                                "originalHeight": img_info.get("imgHeight", 0),
+                            },
+                        })
+                    except Exception as e:
+                        # Image upload failed — insert as caption text
+                        paragraphs.append({
+                            "name": _random_hex(),
+                            "type": 1,
+                            "text": f"[Image: {alt_text}] (upload failed: {e})",
+                            "markups": [],
+                        })
+                else:
+                    paragraphs.append({
+                        "name": _random_hex(),
+                        "type": 1,
+                        "text": f"[Image: {alt_text}] (file not found: {img_src})",
+                        "markups": [],
+                    })
+            else:
+                # URL-based image — Medium can sideload these
+                paragraphs.append({
+                    "name": _random_hex(),
+                    "type": 4,
+                    "text": alt_text,
+                    "markups": [],
+                    "iframe": {"mediaResourceId": img_src},
+                })
+            continue
+
         # Headings
         if stripped.startswith("## "):
             paragraphs.append({
                 "name": _random_hex(),
-                "type": 3,  # H3 (Medium uses H3 for section headers)
+                "type": 3,
                 "text": stripped[3:],
                 "markups": [],
             })
@@ -322,7 +427,7 @@ def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
         if stripped.startswith("> "):
             paragraphs.append({
                 "name": _random_hex(),
-                "type": 6,  # Blockquote
+                "type": 6,
                 "text": stripped[2:],
                 "markups": [],
             })
@@ -332,63 +437,23 @@ def _markdown_to_paragraphs(title: str, content: str) -> list[dict[str, Any]]:
         if stripped in ("---", "***", "___"):
             paragraphs.append({
                 "name": _random_hex(),
-                "type": 15,  # Separator
+                "type": 15,
                 "text": "",
                 "markups": [],
             })
             continue
 
-        # Regular paragraph — parse inline markups (bold, italic, links)
+        # Regular paragraph — strip markdown formatting
         text = stripped
-        markups: list[dict[str, Any]] = []
-
-        # Process **bold**
-        for match in re.finditer(r"\*\*(.+?)\*\*", text):
-            markups.append({
-                "type": 1,  # Bold
-                "start": match.start(),
-                "end": match.end(),
-            })
-
-        # Process *italic*
-        for match in re.finditer(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", text):
-            markups.append({
-                "type": 2,  # Italic
-                "start": match.start(),
-                "end": match.end(),
-            })
-
-        # Process [text](url) links
-        for match in re.finditer(r"\[(.+?)\]\((.+?)\)", text):
-            markups.append({
-                "type": 3,  # Link
-                "start": match.start(),
-                "end": match.start() + len(match.group(1)),
-                "href": match.group(2),
-            })
-
-        # Strip markdown formatting from display text
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
         text = re.sub(r"\[(.+?)\]\(.+?\)", r"\1", text)
 
-        # Recalculate markup positions after stripping
-        # (simplified: just store text without formatting for now,
-        #  markups reference positions in the cleaned text)
-        markups_clean: list[dict[str, Any]] = []
-        clean_text = stripped
-        offset = 0
-        # Re-parse on clean text for accurate positions
-        clean_text = text
-
-        for match in re.finditer(r"placeholder_never_matches", clean_text):
-            pass  # markups already approximate
-
         paragraphs.append({
             "name": _random_hex(),
-            "type": 1,  # Normal paragraph
-            "text": clean_text,
-            "markups": markups_clean,
+            "type": 1,
+            "text": text,
+            "markups": [],
         })
 
     return paragraphs
@@ -401,19 +466,22 @@ async def create_post_via_session(
     publish_status: str = "draft",
     tags: Optional[list[str]] = None,
     canonical_url: Optional[str] = None,
+    base_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Create a Medium post with full content using the session cookie.
 
     Uses Medium's internal delta-based OT save system:
     1. GraphQL createPost → empty draft
-    2. POST /p/{id}/deltas → write title + body paragraphs
-    3. GraphQL setPostTags → set tags
-    4. GraphQL publishPost → publish (if requested)
+    2. Upload images to Medium CDN (if markdown references local files)
+    3. POST /p/{id}/deltas → write title + body paragraphs + images
+    4. GraphQL setPostTags → set tags
+    5. GraphQL publishPost → publish (if requested)
 
     content_format:  'markdown' (default) — content is parsed into paragraphs
     publish_status:  'draft' (default) or 'public'
     tags:            up to 5 tag strings
+    base_path:       directory to resolve relative image paths against
 
     Auth: MEDIUM_SESSION_COOKIE (plus browser auth state for Cloudflare cookies)
     """
@@ -450,8 +518,8 @@ async def create_post_via_session(
         if not post_id:
             raise ValueError("createPost returned no post ID")
 
-        # Step 2: Write content via delta OT system
-        paragraphs = _markdown_to_paragraphs(title, content)
+        # Step 2: Write content via delta OT system (uploads images if present)
+        paragraphs = await _markdown_to_paragraphs(title, content, base_path, post_id)
         lock_id = str(random.randint(1000, 9999))
 
         delta_headers = {
@@ -480,24 +548,36 @@ async def create_post_via_session(
 
         # Insert + update each paragraph
         for i, para in enumerate(paragraphs):
-            # Insert empty paragraph
+            # Build the insert paragraph (type 1 delta)
+            insert_para: dict[str, Any] = {
+                "name": para["name"],
+                "type": para["type"],
+                "text": "",
+                "markups": [],
+            }
             deltas.append({
                 "type": 1,
                 "index": i,
-                "paragraph": {
-                    "name": para["name"],
-                    "type": para["type"],
-                    "text": "",
-                    "markups": [],
-                },
+                "paragraph": insert_para,
                 **({"isStartOfSection": False} if i > 0 else {}),
             })
-            # Update with content
-            if para["text"]:
+
+            # Build the update paragraph (type 3 delta)
+            update_para: dict[str, Any] = {
+                "name": para["name"],
+                "type": para["type"],
+                "text": para.get("text", ""),
+                "markups": para.get("markups", []),
+            }
+            # Image paragraphs carry metadata with the CDN fileId
+            if para.get("metadata"):
+                update_para["metadata"] = para["metadata"]
+
+            if para.get("text") or para.get("metadata"):
                 deltas.append({
                     "type": 3,
                     "index": i,
-                    "paragraph": para,
+                    "paragraph": update_para,
                     "verifySameName": True,
                 })
 

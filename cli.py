@@ -89,12 +89,16 @@ async def cmd_publish_medium(args):
         tags = [t.strip() for t in tags.split(",")]
     status = args.status or "draft"
 
+    # Resolve base path for relative image references
+    base_path = os.path.dirname(os.path.abspath(args.file))
+
     print(f"Publishing to Medium: \"{title}\" ({status})")
     result = await create_post_via_session(
         title=title,
         content=body,
         publish_status=status,
         tags=tags,
+        base_path=base_path,
     )
     print(json.dumps(result, indent=2))
     print(f"\nEdit: {result.get('editUrl', 'N/A')}")
