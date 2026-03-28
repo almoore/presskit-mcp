@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 publishing-mcp = "server:main"
+presskit = "cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["medium", "substack"]
