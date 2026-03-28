@@ -274,7 +274,7 @@ async def upload_image(
         r = await client.post(
             f"{MEDIUM_WEB_BASE}/_/upload?source=6",
             headers=upload_headers,
-            files={"image": (filename, image_data, mime_type)},
+            files={"uploadedFile": (filename, image_data, mime_type)},
             follow_redirects=True,
         )
         r.raise_for_status()
@@ -548,6 +548,8 @@ async def create_post_via_session(
 
         # Insert + update each paragraph
         for i, para in enumerate(paragraphs):
+            is_image = para["type"] == 4
+
             # Build the insert paragraph (type 1 delta)
             insert_para: dict[str, Any] = {
                 "name": para["name"],
@@ -555,6 +557,10 @@ async def create_post_via_session(
                 "text": "",
                 "markups": [],
             }
+            if is_image:
+                insert_para["layout"] = 1
+                insert_para["metadata"] = {}
+
             deltas.append({
                 "type": 1,
                 "index": i,
@@ -569,9 +575,9 @@ async def create_post_via_session(
                 "text": para.get("text", ""),
                 "markups": para.get("markups", []),
             }
-            # Image paragraphs carry metadata with the CDN fileId
-            if para.get("metadata"):
-                update_para["metadata"] = para["metadata"]
+            if is_image:
+                update_para["layout"] = 1
+                update_para["metadata"] = para.get("metadata", {})
 
             if para.get("text") or para.get("metadata"):
                 deltas.append({
