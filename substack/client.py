@@ -231,18 +231,22 @@ async def create_draft(
     audience: str = "everyone",
     write_comment_permissions: str = "everyone",
     publication_url: Optional[str] = None,
+    base_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Create a Substack draft using python-substack's Post object.
 
-    body_markdown is split into paragraphs and added via Post.add(), which
-    converts content to Substack's internal ProseMirror JSON format — ensuring
-    proper rich-text rendering rather than the plain text produced by raw HTTP.
+    Parses markdown into proper ProseMirror nodes: headings, paragraphs,
+    blockquotes, horizontal rules, code blocks, and images. Local images
+    are uploaded to Substack's CDN via api.get_image().
 
     audience: 'everyone' | 'only_paid' | 'founding' | 'only_free'
     write_comment_permissions: 'everyone' | 'only_paid' | 'none'
+    base_path: directory for resolving relative image paths
     """
-    _, Post = _import_substack()
+    import re
+
+    Api, Post = _import_substack()
 
     def _create():
         api = _make_api(publication_url)
@@ -256,11 +260,81 @@ async def create_draft(
             write_comment_permissions=write_comment_permissions,
         )
 
-        # Split on double newlines to preserve paragraph structure.
-        # python-substack's Post.add() wraps each in a proper ProseMirror paragraph node.
-        paragraphs = [p.strip() for p in body_markdown.split("\n\n") if p.strip()]
-        for para in paragraphs:
-            post.add({"type": "paragraph", "content": para})
+        lines = body_markdown.strip().split("\n")
+        # Strip leading # title if it matches
+        if lines and lines[0].startswith("# "):
+            lines = lines[1:]
+
+        image_re = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+        in_code_block = False
+        code_lines: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Code block handling
+            if stripped.startswith("```"):
+                if in_code_block:
+                    post.code_block("\n".join(code_lines))
+                    code_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_lines.append(line)
+                continue
+
+            # Skip empty lines
+            if not stripped:
+                continue
+
+            # Images
+            img_match = image_re.match(stripped)
+            if img_match:
+                alt_text = img_match.group(1)
+                img_src = img_match.group(2)
+
+                # Resolve relative paths
+                if not img_src.startswith(("http://", "https://")):
+                    if base_path:
+                        img_src = os.path.join(base_path, img_src)
+                    if os.path.isfile(img_src):
+                        try:
+                            cdn_result = api.get_image(img_src)
+                            cdn_url = cdn_result if isinstance(cdn_result, str) else cdn_result.get("url", str(cdn_result))
+                            post.paragraph()
+                            post.captioned_image(src=cdn_url, alt=alt_text)
+                        except Exception:
+                            post.paragraph(f"[Image: {alt_text}]")
+                    else:
+                        post.paragraph(f"[Image: {alt_text}] (file not found)")
+                else:
+                    post.paragraph()
+                    post.captioned_image(src=img_src, alt=alt_text)
+                continue
+
+            # Headings
+            if stripped.startswith("## "):
+                post.heading(stripped[3:], level=2)
+                continue
+            if stripped.startswith("### "):
+                post.heading(stripped[4:], level=3)
+                continue
+
+            # Horizontal rule
+            if stripped in ("---", "***", "___"):
+                post.horizontal_rule()
+                continue
+
+            # Blockquote
+            if stripped.startswith("> "):
+                post.blockquote(stripped[2:])
+                continue
+
+            # Regular paragraph
+            post.paragraph(stripped)
 
         draft = api.post_draft(post.get_draft())
         return draft if isinstance(draft, dict) else vars(draft)

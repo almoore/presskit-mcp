@@ -117,11 +117,14 @@ async def cmd_publish_substack(args):
     subtitle = args.subtitle or meta.get("subtitle", "")
     status = args.status or "draft"
 
+    base_path = os.path.dirname(os.path.abspath(args.file))
+
     print(f"Publishing to Substack: \"{title}\" ({status})")
     result = await create_draft(
         title=title,
         body_markdown=body,
         subtitle=subtitle,
+        base_path=base_path,
     )
     draft_id = result.get("id")
     print(f"Draft created: {json.dumps(result, indent=2, default=str)}")
