@@ -30,11 +30,44 @@ DEFAULT_TIMEOUT = 20.0
 # ── Lazy import guard ──────────────────────────────────────────────────────────
 
 def _import_substack():
+    """
+    Import python-substack's Api and Post classes.
+
+    Our local 'substack/' package shadows the installed 'python-substack'
+    (which also installs as 'substack'). We temporarily manipulate sys.path
+    to find the real package from site-packages.
+    """
+    import importlib
+    import sys
+
+    # Check if the real python-substack is already importable
+    # (won't be if our local package shadows it)
     try:
+        # Try importing from the installed package directly
+        mod = importlib.import_module("substack")
+        if hasattr(mod, "Api"):
+            return mod.Api, mod.post.Post
+
+        # Our local module was found — temporarily remove local paths
+        original_path = sys.path[:]
+        sys.path = [p for p in sys.path if not p.endswith("presskit-mcp") and p not in ("", ".")]
+
+        # Force re-import from site-packages
+        for key in list(sys.modules):
+            if key == "substack" or key.startswith("substack."):
+                del sys.modules[key]
+
         from substack import Api
         from substack.post import Post
+
+        # Restore path and re-import our local module
+        sys.path = original_path
+        for key in list(sys.modules):
+            if key == "substack" or key.startswith("substack."):
+                del sys.modules[key]
+
         return Api, Post
-    except ImportError:
+    except (ImportError, AttributeError):
         raise ImportError(
             "python-substack is not installed. Run: pip install python-substack"
         )
@@ -229,7 +262,7 @@ async def create_draft(
         for para in paragraphs:
             post.add({"type": "paragraph", "content": para})
 
-        draft = api.post_draft(post)
+        draft = api.post_draft(post.get_draft())
         return draft if isinstance(draft, dict) else vars(draft)
 
     return await _run(_create)
