@@ -73,6 +73,59 @@ def _extract_title(meta: dict, body: str) -> tuple[str, str]:
     return "Untitled", body
 
 
+# ── Duplicate detection ───────────────────────────────────────────────────────
+
+
+def _check_frontmatter_published(meta: dict, platform: str) -> bool:
+    """Check if frontmatter indicates already published to this platform."""
+    status = meta.get("status", "")
+    published_on = meta.get("published_on", "")
+
+    if status != "published" and status != "draft":
+        return False
+
+    # Check published_on field
+    if isinstance(published_on, list):
+        return platform in published_on
+    if isinstance(published_on, str):
+        return platform in published_on
+
+    return False
+
+
+async def _check_medium_duplicate(title: str) -> str | None:
+    """Check if an article with this title already exists on Medium as a draft."""
+    try:
+        from medium.client import list_posts
+        posts = await list_posts("alexander.g.moore1", limit=25)
+        for p in posts:
+            existing_title = p.get("title", "")
+            if existing_title and existing_title.strip().lower() == title.strip().lower():
+                post_id = p.get("id", p.get("uniqueSlug", ""))
+                return f"https://medium.com/p/{post_id}/edit"
+    except Exception:
+        pass  # List failed (auth, network) — don't block publish
+    return None
+
+
+async def _check_substack_duplicate(title: str) -> str | None:
+    """Check if an article with this title already exists on Substack as a draft."""
+    try:
+        from substack.client import get_drafts
+        drafts = await get_drafts()
+        for d in drafts:
+            existing_title = (
+                d.get("title", "") or
+                d.get("draft_title", "") or ""
+            )
+            if existing_title.strip().lower() == title.strip().lower():
+                draft_id = d.get("id", "")
+                return f"Draft ID: {draft_id}"
+    except Exception:
+        pass
+    return None
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 
@@ -88,6 +141,21 @@ async def cmd_publish_medium(args):
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",")]
     status = args.status or "draft"
+
+    # Check 1: Frontmatter says already published
+    if _check_frontmatter_published(meta, "medium") and not args.force:
+        print(f"SKIP: \"{title}\" — frontmatter shows already published to Medium.")
+        print("  Use --force to publish anyway.")
+        return
+
+    # Check 2: Duplicate on platform
+    if not args.force:
+        existing = await _check_medium_duplicate(title)
+        if existing:
+            print(f"SKIP: \"{title}\" — already exists on Medium.")
+            print(f"  Existing: {existing}")
+            print("  Use --force to create a new draft anyway.")
+            return
 
     # Resolve base path for relative image references
     base_path = os.path.dirname(os.path.abspath(args.file))
@@ -116,6 +184,21 @@ async def cmd_publish_substack(args):
     title, body = _extract_title(meta, body)
     subtitle = args.subtitle or meta.get("subtitle", "")
     status = args.status or "draft"
+
+    # Check 1: Frontmatter says already published
+    if _check_frontmatter_published(meta, "substack") and not args.force:
+        print(f"SKIP: \"{title}\" — frontmatter shows already published to Substack.")
+        print("  Use --force to publish anyway.")
+        return
+
+    # Check 2: Duplicate on platform
+    if not args.force:
+        existing = await _check_substack_duplicate(title)
+        if existing:
+            print(f"SKIP: \"{title}\" — already exists on Substack.")
+            print(f"  Existing: {existing}")
+            print("  Use --force to create a new draft anyway.")
+            return
 
     base_path = os.path.dirname(os.path.abspath(args.file))
 
@@ -216,6 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--subtitle", default=None, help="Post subtitle (Substack)")
         p.add_argument("--no-email", action="store_true",
                         help="Publish to web only, no subscriber email (Substack)")
+        p.add_argument("--force", action="store_true",
+                        help="Publish even if already exists (skip duplicate check)")
 
     # ── list ──────────────────────────────────────────────────────────────
     lst = sub.add_parser("list", help="List published posts")
