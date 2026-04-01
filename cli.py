@@ -10,8 +10,9 @@ Usage:
     presskit list substack   [--subdomain your_sub] [--limit 10]
     presskit drafts substack
 
-Reads markdown files and publishes them via the same client functions
-used by the MCP server — no MCP protocol involved.
+Draft IDs are stored in frontmatter (medium_draft_id, substack_draft_id).
+Re-running publish on the same file updates the existing draft instead of
+creating a duplicate.
 """
 
 import argparse
@@ -73,57 +74,196 @@ def _extract_title(meta: dict, body: str) -> tuple[str, str]:
     return "Untitled", body
 
 
-# ── Duplicate detection ───────────────────────────────────────────────────────
+# ── Frontmatter ID management ────────────────────────────────────────────────
 
 
-def _check_frontmatter_published(meta: dict, platform: str) -> bool:
-    """Check if frontmatter indicates already published to this platform."""
-    status = meta.get("status", "")
-    published_on = meta.get("published_on", "")
+def _write_frontmatter_field(file_path: str, key: str, value: str):
+    """Add or update a field in a markdown file's YAML frontmatter."""
+    with open(file_path) as f:
+        content = f.read()
 
-    if status != "published" and status != "draft":
-        return False
+    if not content.startswith("---"):
+        return
 
-    # Check published_on field
-    if isinstance(published_on, list):
-        return platform in published_on
-    if isinstance(published_on, str):
-        return platform in published_on
+    end = content.find("\n---", 3)
+    if end == -1:
+        return
 
-    return False
+    frontmatter = content[3:end]
+    body = content[end:]
+
+    # Check if key already exists
+    lines = frontmatter.split("\n")
+    found = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f"{key}:"):
+            lines[i] = f"{key}: {value}"
+            found = True
+            break
+
+    if not found:
+        lines.append(f"{key}: {value}")
+
+    new_frontmatter = "\n".join(lines)
+    with open(file_path, "w") as f:
+        f.write(f"---{new_frontmatter}{body}")
 
 
-async def _check_medium_duplicate(title: str) -> str | None:
-    """Check if an article with this title already exists on Medium as a draft."""
-    try:
-        from medium.client import list_posts
-        posts = await list_posts("alexander.g.moore1", limit=25)
-        for p in posts:
-            existing_title = p.get("title", "")
-            if existing_title and existing_title.strip().lower() == title.strip().lower():
-                post_id = p.get("id", p.get("uniqueSlug", ""))
-                return f"https://medium.com/p/{post_id}/edit"
-    except Exception:
-        pass  # List failed (auth, network) — don't block publish
-    return None
+# ── Medium update ─────────────────────────────────────────────────────────────
 
 
-async def _check_substack_duplicate(title: str) -> str | None:
-    """Check if an article with this title already exists on Substack as a draft."""
-    try:
-        from substack.client import get_drafts
-        drafts = await get_drafts()
-        for d in drafts:
-            existing_title = (
-                d.get("title", "") or
-                d.get("draft_title", "") or ""
+async def _update_medium_draft(post_id: str, title: str, body: str, tags: list | None, base_path: str | None):
+    """Update an existing Medium draft by clearing and rewriting all content via delta OT."""
+    import time
+    import random
+    from medium.client import (
+        _graphql_headers, _parse_medium_json, _markdown_to_paragraphs,
+        _random_hex, MEDIUM_WEB_BASE,
+    )
+    import httpx
+
+    headers = _graphql_headers()
+    cookie_str = headers["Cookie"]
+    xsrf = headers.get("x-xsrf-token", "")
+
+    delta_headers = {
+        "Cookie": cookie_str,
+        "X-XSRF-Token": xsrf,
+        "X-Client-Date": str(int(time.time() * 1000)),
+        "X-Obvious-CID": "web",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": headers["User-Agent"],
+        "Referer": f"{MEDIUM_WEB_BASE}/p/{post_id}/edit",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Step 1: Get current state to find baseRev and existing paragraphs
+        r = await client.get(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?baseRev=-1",
+            headers=delta_headers,
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = _parse_medium_json(r.text)
+        entries = data.get("payload", {}).get("postDeltas", [])
+        base_rev = max((e.get("rev", 0) for e in entries), default=0)
+
+        # Replay to count existing paragraphs
+        para_count = 0
+        for entry in entries:
+            delta = entry.get("delta", {})
+            if delta.get("type") == 1:
+                para_count += 1
+            elif delta.get("type") == 2:
+                para_count -= 1
+
+        # Step 2: Delete all existing paragraphs (in reverse order)
+        delete_deltas = []
+        for i in range(para_count - 1, -1, -1):
+            delete_deltas.append({"type": 2, "index": i})
+
+        if delete_deltas:
+            lock_id = str(random.randint(1000, 9999))
+            delta_headers["X-Client-Date"] = str(int(time.time() * 1000))
+
+            payload = {
+                "id": post_id,
+                "deltas": delete_deltas,
+                "baseRev": base_rev,
+            }
+            r2 = await client.post(
+                f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
+                headers=delta_headers,
+                json=payload,
+                follow_redirects=True,
             )
-            if existing_title.strip().lower() == title.strip().lower():
-                draft_id = d.get("id", "")
-                return f"Draft ID: {draft_id}"
-    except Exception:
-        pass
-    return None
+            r2.raise_for_status()
+            resp = _parse_medium_json(r2.text)
+            base_rev = resp.get("payload", {}).get("value", {}).get("latestRev", base_rev + len(delete_deltas))
+
+        # Step 3: Write new content (same as create_post_via_session)
+        paragraphs = await _markdown_to_paragraphs(title, body, base_path, post_id)
+        lock_id = str(random.randint(1000, 9999))
+
+        deltas = []
+        # Section marker
+        deltas.append({
+            "type": 8, "index": 0,
+            "section": {"name": _random_hex(), "startIndex": 0},
+        })
+
+        for i, para in enumerate(paragraphs):
+            is_image = para["type"] == 4
+            insert_para = {
+                "name": para["name"],
+                "type": para["type"],
+                "text": "",
+                "markups": [],
+            }
+            if is_image:
+                insert_para["layout"] = 1
+                insert_para["metadata"] = {}
+
+            deltas.append({
+                "type": 1, "index": i,
+                "paragraph": insert_para,
+                **({"isStartOfSection": False} if i > 0 else {}),
+            })
+
+            update_para = {
+                "name": para["name"],
+                "type": para["type"],
+                "text": para.get("text", ""),
+                "markups": para.get("markups", []),
+            }
+            if is_image:
+                update_para["layout"] = 1
+                update_para["metadata"] = para.get("metadata", {})
+
+            if para.get("text") or para.get("metadata"):
+                deltas.append({
+                    "type": 3, "index": i,
+                    "paragraph": update_para,
+                    "verifySameName": True,
+                })
+
+        delta_headers["X-Client-Date"] = str(int(time.time() * 1000))
+        payload = {"id": post_id, "deltas": deltas, "baseRev": base_rev}
+
+        r3 = await client.post(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
+            headers=delta_headers,
+            json=payload,
+            follow_redirects=True,
+        )
+        r3.raise_for_status()
+        resp = _parse_medium_json(r3.text)
+        save_result = resp.get("payload", {}).get("value", {})
+
+        # Step 4: Update tags
+        if tags:
+            await client.post(
+                f"{MEDIUM_WEB_BASE}/_/graphql",
+                headers=headers,
+                json={
+                    "query": (
+                        "mutation SetPostTags($targetPostId: ID!, $tagNames: [String!]!) { "
+                        "setPostTags(targetPostId: $targetPostId, tagNames: $tagNames) { id title } }"
+                    ),
+                    "variables": {"targetPostId": post_id, "tagNames": tags[:5]},
+                },
+                follow_redirects=True,
+            )
+
+    return {
+        "id": post_id,
+        "title": save_result.get("title", title),
+        "latestRev": save_result.get("latestRev"),
+        "paragraphCount": len(paragraphs),
+        "editUrl": f"{MEDIUM_WEB_BASE}/p/{post_id}/edit",
+        "updated": True,
+    }
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -141,25 +281,20 @@ async def cmd_publish_medium(args):
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",")]
     status = args.status or "draft"
-
-    # Check 1: Frontmatter says already published
-    if _check_frontmatter_published(meta, "medium") and not args.force:
-        print(f"SKIP: \"{title}\" — frontmatter shows already published to Medium.")
-        print("  Use --force to publish anyway.")
-        return
-
-    # Check 2: Duplicate on platform
-    if not args.force:
-        existing = await _check_medium_duplicate(title)
-        if existing:
-            print(f"SKIP: \"{title}\" — already exists on Medium.")
-            print(f"  Existing: {existing}")
-            print("  Use --force to create a new draft anyway.")
-            return
-
-    # Resolve base path for relative image references
     base_path = os.path.dirname(os.path.abspath(args.file))
 
+    # Check for existing draft ID in frontmatter
+    existing_id = meta.get("medium_draft_id", "").strip()
+
+    if existing_id and not args.force:
+        # Update existing draft
+        print(f"Updating Medium draft {existing_id}: \"{title}\"")
+        result = await _update_medium_draft(existing_id, title, body, tags, base_path)
+        print(json.dumps(result, indent=2))
+        print(f"\nUpdated: {result.get('editUrl', 'N/A')}")
+        return
+
+    # Create new draft
     print(f"Publishing to Medium: \"{title}\" ({status})")
     result = await create_post_via_session(
         title=title,
@@ -173,9 +308,16 @@ async def cmd_publish_medium(args):
     if result.get("mediumUrl"):
         print(f"URL:  {result['mediumUrl']}")
 
+    # Write draft ID back to frontmatter
+    post_id = result.get("id", "")
+    if post_id:
+        _write_frontmatter_field(args.file, "medium_draft_id", post_id)
+        _write_frontmatter_field(args.file, "medium_edit_url", result.get("editUrl", ""))
+        print(f"Saved medium_draft_id={post_id} to frontmatter")
+
 
 async def cmd_publish_substack(args):
-    from substack.client import create_draft, publish_post
+    from substack.client import create_draft, publish_post, update_draft
 
     with open(args.file) as f:
         raw = f.read()
@@ -184,24 +326,25 @@ async def cmd_publish_substack(args):
     title, body = _extract_title(meta, body)
     subtitle = args.subtitle or meta.get("subtitle", "")
     status = args.status or "draft"
-
-    # Check 1: Frontmatter says already published
-    if _check_frontmatter_published(meta, "substack") and not args.force:
-        print(f"SKIP: \"{title}\" — frontmatter shows already published to Substack.")
-        print("  Use --force to publish anyway.")
-        return
-
-    # Check 2: Duplicate on platform
-    if not args.force:
-        existing = await _check_substack_duplicate(title)
-        if existing:
-            print(f"SKIP: \"{title}\" — already exists on Substack.")
-            print(f"  Existing: {existing}")
-            print("  Use --force to create a new draft anyway.")
-            return
-
     base_path = os.path.dirname(os.path.abspath(args.file))
 
+    # Check for existing draft ID in frontmatter
+    existing_id = meta.get("substack_draft_id", "").strip()
+
+    if existing_id and not args.force:
+        # Update existing draft
+        print(f"Updating Substack draft {existing_id}: \"{title}\"")
+        result = await update_draft(
+            draft_id=int(existing_id),
+            title=title,
+            body_markdown=body,
+            subtitle=subtitle,
+            base_path=base_path,
+        )
+        print(f"Updated: {json.dumps(result, indent=2, default=str)}")
+        return
+
+    # Create new draft
     print(f"Publishing to Substack: \"{title}\" ({status})")
     result = await create_draft(
         title=title,
@@ -211,6 +354,11 @@ async def cmd_publish_substack(args):
     )
     draft_id = result.get("id")
     print(f"Draft created: {json.dumps(result, indent=2, default=str)}")
+
+    # Write draft ID back to frontmatter
+    if draft_id:
+        _write_frontmatter_field(args.file, "substack_draft_id", str(draft_id))
+        print(f"Saved substack_draft_id={draft_id} to frontmatter")
 
     if status == "public" and draft_id:
         send_email = not args.no_email
@@ -300,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-email", action="store_true",
                         help="Publish to web only, no subscriber email (Substack)")
         p.add_argument("--force", action="store_true",
-                        help="Publish even if already exists (skip duplicate check)")
+                        help="Create new draft even if one exists (ignore saved draft ID)")
 
     # ── list ──────────────────────────────────────────────────────────────
     lst = sub.add_parser("list", help="List published posts")

@@ -342,6 +342,100 @@ async def create_draft(
     return await _run(_create)
 
 
+async def update_draft(
+    draft_id: int,
+    title: str,
+    body_markdown: str,
+    subtitle: Optional[str] = None,
+    publication_url: Optional[str] = None,
+    base_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Update an existing Substack draft using python-substack's put_draft.
+
+    Rebuilds the ProseMirror body from markdown and sends it as an update.
+    """
+    import re
+
+    Api, Post = _import_substack()
+
+    def _update():
+        api = _make_api(publication_url)
+        user_id = api.get_user_id()
+
+        post = Post(
+            title=title,
+            subtitle=subtitle or "",
+            user_id=user_id,
+        )
+
+        lines = body_markdown.strip().split("\n")
+        if lines and lines[0].startswith("# "):
+            lines = lines[1:]
+
+        image_re = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+        in_code_block = False
+        code_lines: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code_block:
+                    post.code_block("\n".join(code_lines))
+                    code_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                continue
+            if in_code_block:
+                code_lines.append(line)
+                continue
+            if not stripped:
+                continue
+
+            img_match = image_re.match(stripped)
+            if img_match:
+                alt_text = img_match.group(1)
+                img_src = img_match.group(2)
+                if not img_src.startswith(("http://", "https://")):
+                    if base_path:
+                        img_src = os.path.join(base_path, img_src)
+                    if os.path.isfile(img_src):
+                        try:
+                            cdn_result = api.get_image(img_src)
+                            cdn_url = cdn_result if isinstance(cdn_result, str) else cdn_result.get("url", str(cdn_result))
+                            post.paragraph()
+                            post.captioned_image(src=cdn_url, alt=alt_text)
+                        except Exception:
+                            post.paragraph(f"[Image: {alt_text}]")
+                    else:
+                        post.paragraph(f"[Image: {alt_text}] (file not found)")
+                else:
+                    post.paragraph()
+                    post.captioned_image(src=img_src, alt=alt_text)
+                continue
+
+            if stripped.startswith("## "):
+                post.heading(stripped[3:], level=2)
+                continue
+            if stripped.startswith("### "):
+                post.heading(stripped[4:], level=3)
+                continue
+            if stripped in ("---", "***", "___"):
+                post.horizontal_rule()
+                continue
+            if stripped.startswith("> "):
+                post.blockquote(stripped[2:])
+                continue
+            post.paragraph(stripped)
+
+        draft_body = post.get_draft()
+        result = api.put_draft(draft_id, draft_body)
+        return result if isinstance(result, dict) else {"status": str(result), "id": draft_id}
+
+    return await _run(_update)
+
+
 async def publish_post(
     post_id: int,
     send_email: bool = True,
