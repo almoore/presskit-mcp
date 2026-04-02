@@ -366,6 +366,11 @@ async def cmd_publish_substack(args):
     subtitle = args.subtitle or meta.get("subtitle", "")
     status = args.status or "draft"
     base_path = os.path.dirname(os.path.abspath(args.file))
+    tags = args.tags.split(",") if args.tags else meta.get("tags", None)
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")]
+    if isinstance(tags, list):
+        tags = [t.strip() for t in tags]
 
     # Check for existing draft ID in frontmatter
     existing_id = meta.get("substack_draft_id", "").strip()
@@ -378,6 +383,7 @@ async def cmd_publish_substack(args):
             title=title,
             body_markdown=body,
             subtitle=subtitle,
+            tags=tags,
             base_path=base_path,
         )
         print(f"Updated: {json.dumps(result, indent=2, default=str)}")
@@ -389,6 +395,7 @@ async def cmd_publish_substack(args):
         title=title,
         body_markdown=body,
         subtitle=subtitle,
+        tags=tags,
         base_path=base_path,
     )
     draft_id = result.get("id")

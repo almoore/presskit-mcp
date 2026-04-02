@@ -301,6 +301,7 @@ async def create_draft(
     title: str,
     body_markdown: str,
     subtitle: Optional[str] = None,
+    tags: Optional[list[str]] = None,
     audience: str = "everyone",
     write_comment_permissions: str = "everyone",
     publication_url: Optional[str] = None,
@@ -410,7 +411,17 @@ async def create_draft(
             post.paragraph(_md_to_prosemirror_chunks(stripped))
 
         draft = api.post_draft(post.get_draft())
-        return draft if isinstance(draft, dict) else vars(draft)
+        result = draft if isinstance(draft, dict) else vars(draft)
+
+        # Apply tags if provided
+        draft_id = result.get("id")
+        if tags and draft_id:
+            try:
+                api.add_tags_to_post(draft_id, tags)
+            except Exception as e:
+                result["tag_warning"] = str(e)
+
+        return result
 
     return await _run(_create)
 
@@ -420,6 +431,7 @@ async def update_draft(
     title: str,
     body_markdown: str,
     subtitle: Optional[str] = None,
+    tags: Optional[list[str]] = None,
     publication_url: Optional[str] = None,
     base_path: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -504,7 +516,16 @@ async def update_draft(
 
         draft_body = post.get_draft()
         result = api.put_draft(draft_id, **draft_body)
-        return result if isinstance(result, dict) else {"status": str(result), "id": draft_id}
+        result = result if isinstance(result, dict) else {"status": str(result), "id": draft_id}
+
+        # Apply tags if provided
+        if tags:
+            try:
+                api.add_tags_to_post(draft_id, tags)
+            except Exception as e:
+                result["tag_warning"] = str(e)
+
+        return result
 
     return await _run(_update)
 
