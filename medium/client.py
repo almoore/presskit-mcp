@@ -292,6 +292,80 @@ def _random_hex(length: int = 4) -> str:
     return "".join(random.choices("0123456789abcdef", k=length))
 
 
+def _extract_markups(text: str) -> tuple[str, list[dict]]:
+    """
+    Extract bold, italic, and link markups from markdown-formatted text.
+
+    Returns (plain_text, markups) where markups is a list of Medium markup objects:
+      - type 1: bold  (**text**)
+      - type 2: italic (*text*)
+      - type 3: link  [text](url)
+
+    Processes in order: links first, then bold, then italic, adjusting
+    character offsets as markdown syntax is stripped.
+    """
+    import re
+
+    markups: list[dict] = []
+    # Process from inside out: links, bold, italic
+
+    # Pass 1: Links [text](url)
+    result = ""
+    pos = 0
+    for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text):
+        result += text[pos:m.start()]
+        start = len(result)
+        link_text = m.group(1)
+        href = m.group(2)
+        result += link_text
+        end = len(result)
+        markups.append({"type": 3, "start": start, "end": end, "href": href})
+        pos = m.end()
+    result += text[pos:]
+    text = result
+
+    # Pass 2: Bold **text**
+    result = ""
+    pos = 0
+    for m in re.finditer(r"\*\*(.+?)\*\*", text):
+        result += text[pos:m.start()]
+        start = len(result)
+        result += m.group(1)
+        end = len(result)
+        markups.append({"type": 1, "start": start, "end": end})
+        pos = m.end()
+    result += text[pos:]
+    text = result
+
+    # Pass 3: Italic *text* (not inside bold)
+    result = ""
+    pos = 0
+    for m in re.finditer(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", text):
+        result += text[pos:m.start()]
+        start = len(result)
+        result += m.group(1)
+        end = len(result)
+        markups.append({"type": 2, "start": start, "end": end})
+        pos = m.end()
+    result += text[pos:]
+    text = result
+
+    # Pass 4: Inline code `text`
+    result = ""
+    pos = 0
+    for m in re.finditer(r"`([^`]+)`", text):
+        result += text[pos:m.start()]
+        start = len(result)
+        result += m.group(1)
+        end = len(result)
+        markups.append({"type": 10, "start": start, "end": end})
+        pos = m.end()
+    result += text[pos:]
+    text = result
+
+    return text, markups
+
+
 async def _markdown_to_paragraphs(
     title: str,
     content: str,
@@ -407,29 +481,32 @@ async def _markdown_to_paragraphs(
 
         # Headings
         if stripped.startswith("## "):
+            h_text, h_markups = _extract_markups(stripped[3:])
             paragraphs.append({
                 "name": _random_hex(),
                 "type": 3,
-                "text": stripped[3:],
-                "markups": [],
+                "text": h_text,
+                "markups": h_markups,
             })
             continue
         if stripped.startswith("### "):
+            h_text, h_markups = _extract_markups(stripped[4:])
             paragraphs.append({
                 "name": _random_hex(),
                 "type": 3,
-                "text": stripped[4:],
-                "markups": [],
+                "text": h_text,
+                "markups": h_markups,
             })
             continue
 
         # Blockquotes
         if stripped.startswith("> "):
+            bq_text, bq_markups = _extract_markups(stripped[2:])
             paragraphs.append({
                 "name": _random_hex(),
                 "type": 6,
-                "text": stripped[2:],
-                "markups": [],
+                "text": bq_text,
+                "markups": bq_markups,
             })
             continue
 
@@ -443,17 +520,14 @@ async def _markdown_to_paragraphs(
             })
             continue
 
-        # Regular paragraph — strip markdown formatting
-        text = stripped
-        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-        text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
-        text = re.sub(r"\[(.+?)\]\(.+?\)", r"\1", text)
+        # Regular paragraph — extract inline formatting as Medium markups
+        text, markups = _extract_markups(stripped)
 
         paragraphs.append({
             "name": _random_hex(),
             "type": 1,
             "text": text,
-            "markups": [],
+            "markups": markups,
         })
 
     return paragraphs

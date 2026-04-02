@@ -126,22 +126,23 @@ async def _update_medium_draft(post_id: str, title: str, body: str, tags: list |
     cookie_str = headers["Cookie"]
     xsrf = headers.get("x-xsrf-token", "")
 
-    delta_headers = {
-        "Cookie": cookie_str,
-        "X-XSRF-Token": xsrf,
-        "X-Client-Date": str(int(time.time() * 1000)),
-        "X-Obvious-CID": "web",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": headers["User-Agent"],
-        "Referer": f"{MEDIUM_WEB_BASE}/p/{post_id}/edit",
-    }
+    def _make_delta_headers():
+        return {
+            "Cookie": cookie_str,
+            "X-XSRF-Token": xsrf,
+            "X-Client-Date": str(int(time.time() * 1000)),
+            "X-Obvious-CID": "web",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": headers["User-Agent"],
+            "Referer": f"{MEDIUM_WEB_BASE}/p/{post_id}/edit",
+        }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Step 1: Get current state to find baseRev and existing paragraphs
+    async def _fetch_state(client):
+        """Fetch current delta state and return (base_rev, para_count)."""
         r = await client.get(
             f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?baseRev=-1",
-            headers=delta_headers,
+            headers=_make_delta_headers(),
             follow_redirects=True,
         )
         r.raise_for_status()
@@ -149,7 +150,6 @@ async def _update_medium_draft(post_id: str, title: str, body: str, tags: list |
         entries = data.get("payload", {}).get("postDeltas", [])
         base_rev = max((e.get("rev", 0) for e in entries), default=0)
 
-        # Replay to count existing paragraphs
         para_count = 0
         for entry in entries:
             delta = entry.get("delta", {})
@@ -157,43 +157,83 @@ async def _update_medium_draft(post_id: str, title: str, body: str, tags: list |
                 para_count += 1
             elif delta.get("type") == 2:
                 para_count -= 1
+        return base_rev, para_count
 
-        # Step 2: Delete all existing paragraphs (in reverse order)
-        delete_deltas = []
-        for i in range(para_count - 1, -1, -1):
-            delete_deltas.append({"type": 2, "index": i})
-
-        if delete_deltas:
-            lock_id = str(random.randint(1000, 9999))
-            delta_headers["X-Client-Date"] = str(int(time.time() * 1000))
-
-            payload = {
-                "id": post_id,
-                "deltas": delete_deltas,
-                "baseRev": base_rev,
-            }
-            r2 = await client.post(
-                f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
-                headers=delta_headers,
-                json=payload,
-                follow_redirects=True,
-            )
-            r2.raise_for_status()
-            resp = _parse_medium_json(r2.text)
-            base_rev = resp.get("payload", {}).get("value", {}).get("latestRev", base_rev + len(delete_deltas))
-
-        # Step 3: Write new content (same as create_post_via_session)
-        paragraphs = await _markdown_to_paragraphs(title, body, base_path, post_id)
+    async def _post_deltas(client, deltas, base_rev):
+        """Post a batch of deltas and return updated base_rev."""
         lock_id = str(random.randint(1000, 9999))
+        payload = {"id": post_id, "deltas": deltas, "baseRev": base_rev}
+        r = await client.post(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
+            headers=_make_delta_headers(),
+            json=payload,
+            follow_redirects=True,
+        )
+        if r.status_code >= 400:
+            print(f"  Delta POST failed ({r.status_code}): {r.text[:500]}", file=sys.stderr)
+            r.raise_for_status()
+        resp = _parse_medium_json(r.text)
+        return resp.get("payload", {}).get("value", {})
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Step 1: Get current state — replay deltas to get paragraph names
+        base_rev, para_count = await _fetch_state(client)
+        print(f"  Current state: rev={base_rev}, paragraphs={para_count}")
+
+        # Step 2: Get existing paragraph names by replaying deltas
+        r = await client.get(
+            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?baseRev=-1",
+            headers=_make_delta_headers(),
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        data = _parse_medium_json(r.text)
+        entries = data.get("payload", {}).get("postDeltas", [])
+
+        # Replay to get ordered list of existing paragraph names
+        existing_names = []
+        for entry in entries:
+            delta = entry.get("delta", {})
+            if delta.get("type") == 1:
+                para = delta.get("paragraph", {})
+                idx = delta.get("index", len(existing_names))
+                existing_names.insert(idx, para.get("name", ""))
+            elif delta.get("type") == 2:
+                idx = delta.get("index", 0)
+                if idx < len(existing_names):
+                    existing_names.pop(idx)
+
+        # Step 3: Build new content
+        paragraphs = await _markdown_to_paragraphs(title, body, base_path, post_id)
+        new_count = len(paragraphs)
+        old_count = len(existing_names)
+        print(f"  Rewriting: {old_count} existing → {new_count} new paragraphs")
 
         deltas = []
-        # Section marker
-        deltas.append({
-            "type": 8, "index": 0,
-            "section": {"name": _random_hex(), "startIndex": 0},
-        })
 
-        for i, para in enumerate(paragraphs):
+        # Update existing paragraphs in-place (reuse names)
+        overlap = min(old_count, new_count)
+        for i in range(overlap):
+            para = paragraphs[i]
+            is_image = para["type"] == 4
+            update_para = {
+                "name": existing_names[i],  # reuse existing name
+                "type": para["type"],
+                "text": para.get("text", ""),
+                "markups": para.get("markups", []),
+            }
+            if is_image:
+                update_para["layout"] = 1
+                update_para["metadata"] = para.get("metadata", {})
+
+            deltas.append({
+                "type": 3, "index": i,
+                "paragraph": update_para,
+            })
+
+        # If new content is longer: insert additional paragraphs
+        for i in range(overlap, new_count):
+            para = paragraphs[i]
             is_image = para["type"] == 4
             insert_para = {
                 "name": para["name"],
@@ -208,7 +248,7 @@ async def _update_medium_draft(post_id: str, title: str, body: str, tags: list |
             deltas.append({
                 "type": 1, "index": i,
                 "paragraph": insert_para,
-                **({"isStartOfSection": False} if i > 0 else {}),
+                "isStartOfSection": False,
             })
 
             update_para = {
@@ -228,18 +268,12 @@ async def _update_medium_draft(post_id: str, title: str, body: str, tags: list |
                     "verifySameName": True,
                 })
 
-        delta_headers["X-Client-Date"] = str(int(time.time() * 1000))
-        payload = {"id": post_id, "deltas": deltas, "baseRev": base_rev}
+        # If new content is shorter: delete excess paragraphs (reverse order)
+        for i in range(old_count - 1, new_count - 1, -1):
+            deltas.append({"type": 2, "index": i})
 
-        r3 = await client.post(
-            f"{MEDIUM_WEB_BASE}/p/{post_id}/deltas?logLockId={lock_id}",
-            headers=delta_headers,
-            json=payload,
-            follow_redirects=True,
-        )
-        r3.raise_for_status()
-        resp = _parse_medium_json(r3.text)
-        save_result = resp.get("payload", {}).get("value", {})
+        save_result = await _post_deltas(client, deltas, base_rev)
+        base_rev = save_result.get("latestRev", base_rev + len(deltas))
 
         # Step 4: Update tags
         if tags:
@@ -289,10 +323,15 @@ async def cmd_publish_medium(args):
     if existing_id and not args.force:
         # Update existing draft
         print(f"Updating Medium draft {existing_id}: \"{title}\"")
-        result = await _update_medium_draft(existing_id, title, body, tags, base_path)
-        print(json.dumps(result, indent=2))
-        print(f"\nUpdated: {result.get('editUrl', 'N/A')}")
-        return
+        try:
+            result = await _update_medium_draft(existing_id, title, body, tags, base_path)
+            print(json.dumps(result, indent=2))
+            print(f"\nUpdated: {result.get('editUrl', 'N/A')}")
+            return
+        except Exception as e:
+            print(f"\nUpdate failed: {e}")
+            print("Draft may be corrupted. Creating new draft instead...")
+            # Fall through to create new draft
 
     # Create new draft
     print(f"Publishing to Medium: \"{title}\" ({status})")
