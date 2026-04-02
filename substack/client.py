@@ -224,6 +224,79 @@ async def get_drafts(publication_url: Optional[str] = None) -> list[dict[str, An
     return await _run(_fetch)
 
 
+def _md_to_prosemirror_chunks(text: str) -> list[dict] | str:
+    """
+    Convert markdown inline formatting to ProseMirror text chunks.
+
+    Returns a list of {"content": "text", "marks": [...]} dicts for
+    python-substack's add_complex_text(), or a plain string if no
+    formatting is found.
+
+    Handles: **bold**, *italic*, [links](url), `inline code`.
+    """
+    import re
+
+    # Quick check: if no formatting, return plain string
+    if not re.search(r'\*|`|\[.*\]\(', text):
+        return text
+
+    chunks: list[dict] = []
+    # Tokenize by finding all inline formatting spans
+    # Order: links first, then bold, then italic, then code
+    # We'll use a single-pass approach with a priority regex
+
+    # Combined pattern: links, bold, italic, code
+    pattern = re.compile(
+        r'(\[([^\]]+)\]\(([^)]+)\))'   # group 1,2,3: link
+        r'|(\*\*(.+?)\*\*)'             # group 4,5: bold
+        r'|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)'  # group 6: italic
+        r'|(`([^`]+)`)'                  # group 7,8: code
+    )
+
+    pos = 0
+    for m in pattern.finditer(text):
+        # Add plain text before this match
+        if m.start() > pos:
+            plain = text[pos:m.start()]
+            if plain:
+                chunks.append({"content": plain, "marks": []})
+
+        if m.group(2) is not None:
+            # Link: [text](url)
+            chunks.append({
+                "content": m.group(2),
+                "marks": [{"type": "link", "attrs": {"href": m.group(3)}}],
+            })
+        elif m.group(5) is not None:
+            # Bold: **text**
+            chunks.append({
+                "content": m.group(5),
+                "marks": [{"type": "bold"}],
+            })
+        elif m.group(6) is not None:
+            # Italic: *text*
+            chunks.append({
+                "content": m.group(6),
+                "marks": [{"type": "italic"}],
+            })
+        elif m.group(8) is not None:
+            # Code: `text`
+            chunks.append({
+                "content": m.group(8),
+                "marks": [{"type": "code"}],
+            })
+
+        pos = m.end()
+
+    # Remaining text after last match
+    if pos < len(text):
+        remaining = text[pos:]
+        if remaining:
+            chunks.append({"content": remaining, "marks": []})
+
+    return chunks if chunks else text
+
+
 async def create_draft(
     title: str,
     body_markdown: str,
@@ -317,10 +390,10 @@ async def create_draft(
 
             # Headings
             if stripped.startswith("## "):
-                post.heading(stripped[3:], level=2)
+                post.heading(_md_to_prosemirror_chunks(stripped[3:]), level=2)
                 continue
             if stripped.startswith("### "):
-                post.heading(stripped[4:], level=3)
+                post.heading(_md_to_prosemirror_chunks(stripped[4:]), level=3)
                 continue
 
             # Horizontal rule
@@ -330,11 +403,11 @@ async def create_draft(
 
             # Blockquote
             if stripped.startswith("> "):
-                post.blockquote(stripped[2:])
+                post.blockquote(_md_to_prosemirror_chunks(stripped[2:]))
                 continue
 
-            # Regular paragraph
-            post.paragraph(stripped)
+            # Regular paragraph — convert inline markdown to ProseMirror marks
+            post.paragraph(_md_to_prosemirror_chunks(stripped))
 
         draft = api.post_draft(post.get_draft())
         return draft if isinstance(draft, dict) else vars(draft)
@@ -416,21 +489,21 @@ async def update_draft(
                 continue
 
             if stripped.startswith("## "):
-                post.heading(stripped[3:], level=2)
+                post.heading(_md_to_prosemirror_chunks(stripped[3:]), level=2)
                 continue
             if stripped.startswith("### "):
-                post.heading(stripped[4:], level=3)
+                post.heading(_md_to_prosemirror_chunks(stripped[4:]), level=3)
                 continue
             if stripped in ("---", "***", "___"):
                 post.horizontal_rule()
                 continue
             if stripped.startswith("> "):
-                post.blockquote(stripped[2:])
+                post.blockquote(_md_to_prosemirror_chunks(stripped[2:]))
                 continue
-            post.paragraph(stripped)
+            post.paragraph(_md_to_prosemirror_chunks(stripped))
 
         draft_body = post.get_draft()
-        result = api.put_draft(draft_id, draft_body)
+        result = api.put_draft(draft_id, **draft_body)
         return result if isinstance(result, dict) else {"status": str(result), "id": draft_id}
 
     return await _run(_update)
